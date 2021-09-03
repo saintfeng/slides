@@ -13,12 +13,32 @@ export default function Kitties (props) {
   const [kitties, setKitties] = useState([])
   const [status, setStatus] = useState('')
 
+  const [kittyDNAs, setKittyDNAs] = useState([])
+  const [kittyOwners, setKittyOwners] = useState([])
+
   const fetchKitties = () => {
     // TODO: 在这里调用 `api.query.kittiesModule.*` 函数去取得猫咪的信息。
     // 你需要取得：
     //   - 共有多少只猫咪
     //   - 每只猫咪的主人是谁
     //   - 每只猫咪的 DNA 是什么，用来组合出它的形态
+
+    let unsubscribe
+    api.query.kittiesModule.kittiesCount(count => {
+      if (count !== '') {
+        const kittyIds = Array.from(Array(parseInt(count, 10)), (v, k) => k)
+        api.query.kittiesModule.owner.multi(kittyIds, kittyOwners => {
+          setKittyOwners(kittyOwners)
+        }).catch(console.error)
+        api.query.kittiesModule.kitties.multi(kittyIds, kittyDna => {
+          setKittyDNAs(kittyDna)
+        }).catch(console.error)
+      }
+    }).then(unsub => {
+      unsubscribe = unsub
+    }).catch(console.error)
+
+    return () => unsubscribe && unsubscribe()
   }
 
   const populateKitties = () => {
@@ -32,11 +52,20 @@ export default function Kitties (props) {
     //  ```
     // 这个 kitties 会传入 <KittyCards/> 然后对每只猫咪进行处理
     const kitties = []
+
+    for (let i = 0; i < kittyDNAs.length; ++i) {
+      const kitty = {}
+      kitty.id = i
+      kitty.dna = kittyDNAs[i].unwrap()
+      kitty.owner = keyring.encodeAddress(kittyOwners[i].unwrap())
+      kitties[i] = kitty
+    }
+
     setKitties(kitties)
   }
 
   useEffect(fetchKitties, [api, keyring])
-  useEffect(populateKitties, [])
+  useEffect(populateKitties, [keyring, kittyDNAs, kittyOwners])
 
   return <Grid.Column width={16}>
     <h1>小毛孩</h1>
