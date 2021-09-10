@@ -6,26 +6,24 @@ pub use pallet::*;
 pub mod pallet {
 	//! A demonstration of an offchain worker that sends onchain callbacks
 	use core::{convert::TryInto, fmt};
-	use parity_scale_codec::{Decode, Encode};
 	use frame_support::pallet_prelude::*;
 	use frame_system::{
-		pallet_prelude::*,
 		offchain::{
 			AppCrypto, CreateSignedTransaction, SendSignedTransaction, SendUnsignedTransaction,
 			SignedPayload, Signer, SigningTypes, SubmitTransaction,
 		},
+		pallet_prelude::*,
 	};
-	use sp_core::{crypto::KeyTypeId};
+	use parity_scale_codec::{Decode, Encode};
 	use sp_arithmetic::per_things::Permill;
+	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::{
 		offchain as rt_offchain,
-		traits::{
-			BlockNumberProvider
-		},
 		offchain::{
 			storage::StorageValueRef,
 			storage_lock::{BlockAndTime, StorageLock},
 		},
+		traits::BlockNumberProvider,
 		transaction_validity::{
 			InvalidTransaction, TransactionSource, TransactionValidity, ValidTransaction,
 		},
@@ -49,6 +47,7 @@ pub mod pallet {
 
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
 	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
+	const HTTP_REMOTE_REQUEST_COINCAP: &str = "https://api.coincap.io/v2/assets/polkadot";
 	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
@@ -75,8 +74,11 @@ pub mod pallet {
 		}
 
 		// implemented for mock runtime in test
-		impl frame_system::offchain::AppCrypto<<Sr25519Signature as Verify>::Signer, Sr25519Signature>
-		for TestAuthId
+		impl
+			frame_system::offchain::AppCrypto<
+				<Sr25519Signature as Verify>::Signer,
+				Sr25519Signature,
+			> for TestAuthId
 		{
 			type RuntimeAppPublic = Public;
 			type GenericSignature = sp_core::sr25519::Signature;
@@ -112,7 +114,7 @@ pub mod pallet {
 
 	pub fn de_string_to_bytes<'de, D>(de: D) -> Result<Vec<u8>, D::Error>
 	where
-	D: Deserializer<'de>,
+		D: Deserializer<'de>,
 	{
 		let s: &str = Deserialize::deserialize(de)?;
 		Ok(s.as_bytes().to_vec())
@@ -128,7 +130,23 @@ pub mod pallet {
 				str::from_utf8(&self.login).map_err(|_| fmt::Error)?,
 				str::from_utf8(&self.blog).map_err(|_| fmt::Error)?,
 				&self.public_repos
-				)
+			)
+		}
+	}
+
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct PriceInfo {
+		#[serde(deserialize_with = "de_string_to_bytes")]
+		price_vec: Vec<u8>,
+	}
+
+	impl fmt::Debug for PriceInfo {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			write!(
+				f,
+				"{{ priceUsd: {} }}",
+				str::from_utf8(&self.price_vec).map_err(|_| fmt::Error)?,
+			)
 		}
 	}
 
@@ -162,6 +180,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		NewPrice(Option<T::AccountId>, (u64, Permill)),
 	}
 
 	// Errors inform users that something went wrong.
@@ -182,6 +201,8 @@ pub mod pallet {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+
+		ParsePriceError,
 	}
 
 	#[pallet::hooks]
@@ -229,24 +250,26 @@ pub mod pallet {
 		/// By default unsigned transactions are disallowed, but implementing the validator
 		/// here we make sure that some particular calls (the ones produced by offchain worker)
 		/// are being whitelisted and marked as valid.
-		fn validate_unsigned(_source: TransactionSource, call: &Self::Call)
-		-> TransactionValidity
-		{
-			let valid_tx = |provide| ValidTransaction::with_tag_prefix("ocw-demo")
-			.priority(UNSIGNED_TXS_PRIORITY)
-			.and_provides([&provide])
-			.longevity(3)
-			.propagate(true)
-			.build();
+		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
+			let valid_tx = |provide| {
+				ValidTransaction::with_tag_prefix("ocw-demo")
+					.priority(UNSIGNED_TXS_PRIORITY)
+					.and_provides([&provide])
+					.longevity(3)
+					.propagate(true)
+					.build()
+			};
 
 			match call {
-				Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
+				Call::submit_number_unsigned(_number) => {
+					valid_tx(b"submit_number_unsigned".to_vec())
+				}
 				Call::submit_number_unsigned_with_signed_payload(ref payload, ref signature) => {
 					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
 						return InvalidTransaction::BadProof.into();
 					}
 					valid_tx(b"submit_number_unsigned_with_signed_payload".to_vec())
-				},
+				}
 				_ => InvalidTransaction::Call.into(),
 			}
 		}
@@ -263,6 +286,15 @@ pub mod pallet {
 			Self::deposit_event(Event::NewNumber(Some(who), number));
 			Ok(())
 		}
+		#[pallet::weight(10000)]
+		pub fn submit_price_signed(origin: OriginFor<T>, price: (u64, Permill)) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			// log::info!("submit_price_signed: ({}.{}, {:?})", price.0, price.1, who);
+			Self::append_or_replace_price(price);
+
+			Self::deposit_event(Event::NewPrice(Some(who), price));
+			Ok(())
+		}
 
 		#[pallet::weight(10000)]
 		pub fn submit_number_unsigned(origin: OriginFor<T>, number: u64) -> DispatchResult {
@@ -275,9 +307,11 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10000)]
-		pub fn submit_number_unsigned_with_signed_payload(origin: OriginFor<T>, payload: Payload<T::Public>,
-			_signature: T::Signature) -> DispatchResult
-		{
+		pub fn submit_number_unsigned_with_signed_payload(
+			origin: OriginFor<T>,
+			payload: Payload<T::Public>,
+			_signature: T::Signature,
+		) -> DispatchResult {
 			let _ = ensure_none(origin)?;
 			// we don't need to verify the signature here because it has been verified in
 			//   `validate_unsigned` function when sending out the unsigned tx.
@@ -303,6 +337,16 @@ pub mod pallet {
 			});
 		}
 
+		fn append_or_replace_price(price: (u64, Permill)) {
+			Prices::<T>::mutate(|prices| {
+				if prices.len() == NUM_VEC_LEN {
+					let _ = prices.pop_front();
+				}
+				prices.push_back(price);
+				log::info!("Prices vector: {:?}", prices);
+			});
+		}
+
 		fn fetch_price_info() -> Result<(), Error<T>> {
 			// TODO: 这是你们的功课
 
@@ -316,9 +360,95 @@ pub mod pallet {
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
 
-			Ok(())
+			let price = Self::fetch_price().map_err(|_| <Error<T>>::HttpFetchingError)?;
+			// let price_info: PriceInfo = PriceInfo { price_vec: price.clone() };
+			let price_str = str::from_utf8(&price).unwrap_or("0");
+			let parsed_price = match Self::parse_price(&price_str) {
+				Some(parsed_price) => Ok(parsed_price),
+				None => {
+					log::warn!("Unable to extract price from the price_str: {:?}", price_str);
+					Err(<Error<T>>::ParsePriceError)
+				}
+			}?;
+
+			let signer = Signer::<T, T::AuthorityId>::any_account();
+			let result = signer.send_signed_transaction(|_acct|
+				// This is the on-chain function
+				Call::submit_price_signed(parsed_price));
+
+			// Display error if the signed tx fails.
+			if let Some((acc, res)) = result {
+				if res.is_err() {
+					log::error!("failure: offchain_signed_tx: tx sent: {:?}", acc.id);
+					return Err(<Error<T>>::OffchainSignedTxError);
+				}
+				return Ok(());
+			}
+
+			log::error!("No local account available");
+			Err(<Error<T>>::NoLocalAcctForSigning)
 		}
 
+		fn fetch_price() -> Result<Vec<u8>, Error<T>> {
+			log::info!("sending request to: {}", HTTP_REMOTE_REQUEST_COINCAP);
+
+			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
+			let request = rt_offchain::http::Request::get(HTTP_REMOTE_REQUEST_COINCAP);
+
+			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
+			let timeout = sp_io::offchain::timestamp()
+				.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+
+			let pending = request
+				.deadline(timeout) // Setting the timeout time
+				.send() // Sending the request out by the host
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			let response = pending
+				.try_wait(timeout)
+				.map_err(|_| <Error<T>>::HttpFetchingError)?
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			if response.code != 200 {
+				log::error!("Unexpected http request status code: {}", response.code);
+				return Err(<Error<T>>::HttpFetchingError);
+			}
+
+			let body = response.body().collect::<Vec<u8>>();
+			let body_str = str::from_utf8(&body).unwrap_or("0");
+			let v: serde_json::Value =
+				serde_json::from_str(&body_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			let price_vec: Vec<u8> = v["data"]["priceUsd"].as_str().unwrap().as_bytes().to_vec();
+
+			Ok(price_vec)
+		}
+
+		fn parse_price(price_str: &str) -> Option<(u64, Permill)> {
+			let price_v: Vec<&str> = price_str.split('.').collect();
+
+			log::info!("Price Vec: {:?}", price_v);
+
+			let num: u64 = price_v[0].parse().unwrap_or(0);
+
+			let mut dec = 032;
+
+			if price_v.len() > 1 {
+				if price_v[1].len() > 6 {
+					dec = price_v[1].get(0..6).unwrap_or("0").parse().unwrap_or(0u32);
+				} else {
+					dec = price_v[1].parse().unwrap_or(0u32);
+					dec = dec * 10u32.pow(6 - price_v[1].len() as u32);
+				}
+			}
+
+			log::info!("Price num: {}, dec: {}", num, dec);
+
+			let permill = Permill::from_parts(dec);
+
+			log::info!("permill {:?}", permill);
+			// 返回Option<(u64, Permill)>结果
+			return Some((num, permill));
+		}
 
 		/// Check if we have fetched github info before. If yes, we can use the cached version
 		///   stored in off-chain worker storage `storage`. If not, we fetch the remote info and
@@ -353,16 +483,21 @@ pub mod pallet {
 			//   4) `with_block_and_time_deadline` - lock with custom time and block expiration
 			// Here we choose the most custom one for demonstration purpose.
 			let mut lock = StorageLock::<BlockAndTime<Self>>::with_block_and_time_deadline(
-				b"offchain-demo::lock", LOCK_BLOCK_EXPIRATION,
-				rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION)
-				);
+				b"offchain-demo::lock",
+				LOCK_BLOCK_EXPIRATION,
+				rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION),
+			);
 
 			// We try to acquire the lock here. If failed, we know the `fetch_n_parse` part inside is being
 			//   executed by previous run of ocw, so the function just returns.
 			if let Ok(_guard) = lock.try_lock() {
 				match Self::fetch_n_parse() {
-					Ok(gh_info) => { s_info.set(&gh_info); }
-					Err(err) => { return Err(err); }
+					Ok(gh_info) => {
+						s_info.set(&gh_info);
+					}
+					Err(err) => {
+						return Err(err);
+					}
 				}
 			}
 			Ok(())
@@ -375,13 +510,14 @@ pub mod pallet {
 				<Error<T>>::HttpFetchingError
 			})?;
 
-			let resp_str = str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			let resp_str =
+				str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
 			// Print out our fetched JSON string
 			log::info!("{}", resp_str);
 
 			// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
 			let gh_info: GithubInfo =
-			serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
+				serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
 			Ok(gh_info)
 		}
 
@@ -395,12 +531,12 @@ pub mod pallet {
 
 			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
 			let timeout = sp_io::offchain::timestamp()
-			.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+				.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
 
 			// For github API request, we also need to specify `user-agent` in http request header.
 			//   See: https://developer.github.com/v3/#user-agent-required
 			let pending = request
-			.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
+				.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
 				.deadline(timeout) // Setting the timeout time
 				.send() // Sending the request out by the host
 				.map_err(|_| <Error<T>>::HttpFetchingError)?;
@@ -410,9 +546,9 @@ pub mod pallet {
 			// The returning value here is a `Result` of `Result`, so we are unwrapping it twice by two `?`
 			//   ref: https://substrate.dev/rustdocs/v2.0.0/sp_runtime/offchain/http/struct.PendingRequest.html#method.try_wait
 			let response = pending
-			.try_wait(timeout)
-			.map_err(|_| <Error<T>>::HttpFetchingError)?
-			.map_err(|_| <Error<T>>::HttpFetchingError)?;
+				.try_wait(timeout)
+				.map_err(|_| <Error<T>>::HttpFetchingError)?
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
 
 			if response.code != 200 {
 				log::error!("Unexpected http request status code: {}", response.code);
@@ -438,8 +574,7 @@ pub mod pallet {
 			//   - `Some((account, Err(())))`: error occured when sending the transaction
 			let result = signer.send_signed_transaction(|_acct|
 				// This is the on-chain function
-				Call::submit_number_signed(number)
-				);
+				Call::submit_number_signed(number));
 
 			// Display error if the signed tx fails.
 			if let Some((acc, res)) = result {
@@ -462,14 +597,17 @@ pub mod pallet {
 
 			// `submit_unsigned_transaction` returns a type of `Result<(), ()>`
 			//   ref: https://substrate.dev/rustdocs/v2.0.0/frame_system/offchain/struct.SubmitTransaction.html#method.submit_unsigned_transaction
-			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
-			.map_err(|_| {
-				log::error!("Failed in offchain_unsigned_tx");
-				<Error<T>>::OffchainUnsignedTxError
-			})
+			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into()).map_err(
+				|_| {
+					log::error!("Failed in offchain_unsigned_tx");
+					<Error<T>>::OffchainUnsignedTxError
+				},
+			)
 		}
 
-		fn offchain_unsigned_tx_signed_payload(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+		fn offchain_unsigned_tx_signed_payload(
+			block_number: T::BlockNumber,
+		) -> Result<(), Error<T>> {
 			// Retrieve the signer to sign the payload
 			let signer = Signer::<T, T::AuthorityId>::any_account();
 
@@ -482,8 +620,8 @@ pub mod pallet {
 			//   - `Some((account, Err(())))`: error occured when sending the transaction
 			if let Some((_, res)) = signer.send_unsigned_transaction(
 				|acct| Payload { number, public: acct.public.clone() },
-				Call::submit_number_unsigned_with_signed_payload
-				) {
+				Call::submit_number_unsigned_with_signed_payload,
+			) {
 				return res.map_err(|_| {
 					log::error!("Failed in offchain_unsigned_tx_signed_payload");
 					<Error<T>>::OffchainUnsignedTxSignedPayloadError
