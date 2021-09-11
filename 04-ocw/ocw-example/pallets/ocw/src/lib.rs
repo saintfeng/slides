@@ -133,23 +133,7 @@ pub mod pallet {
 			)
 		}
 	}
-
-	#[derive(Deserialize, Encode, Decode, Default)]
-	struct PriceInfo {
-		#[serde(deserialize_with = "de_string_to_bytes")]
-		price_vec: Vec<u8>,
-	}
-
-	impl fmt::Debug for PriceInfo {
-		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-			write!(
-				f,
-				"{{ priceUsd: {} }}",
-				str::from_utf8(&self.price_vec).map_err(|_| fmt::Error)?,
-			)
-		}
-	}
-
+	
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
 		/// The overarching event type.
@@ -370,7 +354,7 @@ pub mod pallet {
 					Err(<Error<T>>::ParsePriceError)
 				}
 			}?;
-
+			//预言机价格是需要认证的数据，避免受到黑客攻击，所以采用签名交易提交回链上。
 			let signer = Signer::<T, T::AuthorityId>::any_account();
 			let result = signer.send_signed_transaction(|_acct|
 				// This is the on-chain function
